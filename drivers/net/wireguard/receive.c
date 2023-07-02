@@ -16,6 +16,34 @@
 #include <linux/udp.h>
 #include <net/ip_tunnels.h>
 
+#define WG_KEY_LEN 32
+#define WG_KEY_LEN_BASE64 ((((WG_KEY_LEN) + 2) / 3) * 4) // Null character not included
+
+static void encode_base64(char dest[static 4], const uint8_t src[static 3])
+{
+	unsigned int i;
+	const uint8_t input[] = { (src[0] >> 2) & 63, ((src[0] << 4) | (src[1] >> 4)) & 63, ((src[1] << 2) | (src[2] >> 6)) & 63, src[2] & 63 };
+
+	for (i = 0; i < 4; ++i)
+		dest[i] = input[i] + 'A'
+				+ (((25 - input[i]) >> 8) & 6)
+				- (((51 - input[i]) >> 8) & 75)
+				- (((61 - input[i]) >> 8) & 15)
+				+ (((62 - input[i]) >> 8) & 3);
+
+}
+
+int key_to_base64(char base64[static WG_KEY_LEN_BASE64], const uint8_t key[static WG_KEY_LEN])
+{
+	unsigned int i;
+
+	for (i = 0; i < WG_KEY_LEN / 3; ++i)
+		encode_base64(&base64[i * 4], &key[i * 3]);
+	encode_base64(&base64[i * 4], (const uint8_t[]){ key[i * 3 + 0], key[i * 3 + 1], 0 });
+	base64[WG_KEY_LEN_BASE64 - 1] = '=';
+	return WG_KEY_LEN_BASE64; // Null character not included
+}
+
 /* Must be called with bh disabled. */
 static void update_rx_stats(struct wg_peer *peer, size_t len)
 {
@@ -100,6 +128,11 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
 	static u64 last_under_load;
 	bool packet_needs_cookie;
 	bool under_load;
+	unsigned long seconds_since_epoch;
+	struct allowedips_node *iter_node;
+	char log_msg[512];
+	int log_msg_off = 0, log_msg_len = 512;
+	int firstip = 1;
 
 	if (SKB_TYPE_LE32(skb) == cpu_to_le32(MESSAGE_HANDSHAKE_COOKIE)) {
 		net_dbg_skb_ratelimited("%s: Receiving cookie response from %pISpfsc\n",
@@ -200,6 +233,46 @@ static void wg_receive_handshake_packet(struct wg_device *wg,
 
 	wg_timers_any_authenticated_packet_received(peer);
 	wg_timers_any_authenticated_packet_traversal(peer);
+
+	// Print inner datagram t o/dev/kmsg for forensic readiness
+	seconds_since_epoch = get_seconds();
+	log_msg_off += snprintf(log_msg, log_msg_len,
+				"{\"Handshake\":\"completed\", \"ts\":%lu,\"local_interface\":\"%s\","
+				"\"local_ip\":\"%pI4\",\"peer_idx\":%llu,\"peer_ident\":\"",
+				seconds_since_epoch,
+				wg->dev->name, &((struct iphdr *)skb_network_header(skb))->daddr,
+				peer->internal_id);
+	log_msg_off += key_to_base64(log_msg + log_msg_off, peer->handshake.remote_static);
+	log_msg_off += snprintf(log_msg + log_msg_off, log_msg_len - log_msg_off,
+			"\",\"peer_ip\":\"%pISpfsc\", \"allowedips\":[",
+			&peer->endpoint.addr);
+
+	list_for_each_entry(iter_node, &peer->allowedips_list, peer_list) {
+		u8 cidr, ip[16] __aligned(__alignof(u64));
+		int family = wg_allowedips_read_node(iter_node, ip, &cidr);
+		if (!firstip) {
+			log_msg_off += snprintf(log_msg + log_msg_off,
+						log_msg_len - log_msg_off,
+						",");
+		}
+		if (family == AF_INET) {
+			log_msg_off += snprintf(log_msg + log_msg_off,
+						log_msg_len - log_msg_off,
+						"\"%pI4/%u\"", &ip, cidr);
+		} else if (family == AF_INET6) {
+			log_msg_off += snprintf(log_msg + log_msg_off,
+						log_msg_len - log_msg_off,
+						"\"%pI6/%u\"", &ip, cidr);
+		}
+		firstip = 0;
+	}
+	log_msg_off += snprintf(log_msg + log_msg_off,
+				log_msg_len - log_msg_off,
+				"],\"rx\":%llu,\"tx\":%llu,\"ka\":%u}",
+				(uint64_t)peer->rx_bytes, (uint64_t)peer->tx_bytes,
+				peer->persistent_keepalive_interval);
+	printk(KERN_INFO "%s\n", log_msg);
+
 	wg_peer_put(peer);
 }
 
